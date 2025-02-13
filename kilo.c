@@ -1,4 +1,8 @@
-/*** includes ***/
+//
+//
+/************* includes *************/
+//
+//
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -8,7 +12,12 @@
 #include <termios.h>
 #include <unistd.h>
 
-/*** defines ***/
+//
+//
+/************* defines *************/
+//
+//
+
 #define KILO_VERSION "0.0.1"
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -16,10 +25,20 @@ enum editorKey {
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
-    ARROW_DOWN
+    ARROW_DOWN,
+    DEL_KEY,
+    HOME_KEY,
+    END_KEY,
+    PAGE_UP,
+    PAGE_DOWN
 };
 
-/*** data ***/
+//
+//
+/************* data *************/
+//
+//
+
 struct termios orig_termios;
 
 struct editorConfig {
@@ -39,7 +58,12 @@ void die(const char *s) {
     exit(1);
 }
 
-/*** terminal ***/
+//
+//
+/************* terminal *************/
+//
+//
+
 void disableRawMode() {
     // Set terminal attributes back to normal with orig_termios
     // You may notice that leftover input is no longer fed back to the shell. TCSAFLUSH below takes care of that
@@ -98,11 +122,36 @@ int editorReadKey() {
         if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
 
         if (seq[0] == '[' ) {
+
+            if (seq[1] >= '0' && seq[1] <= '9') {
+                if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                        case '1': return HOME_KEY;
+                        case '3': return DEL_KEY;
+                        case '4': return END_KEY;
+                        case '5': return PAGE_UP;
+                        case '6': return PAGE_DOWN;
+                        case '7': return HOME_KEY;
+                        case '8': return END_KEY;
+                    }
+                }
+            }
+            else {
+                switch (seq[1]) {
+                    case 'A': return ARROW_UP;
+                    case 'B': return ARROW_DOWN;
+                    case 'C': return ARROW_RIGHT;
+                    case 'D': return ARROW_LEFT;
+                    case 'H': return HOME_KEY;
+                    case 'F': return END_KEY;
+                }
+            }
+        }
+        else if (seq[0] == 'O') {
             switch (seq[1]) {
-                case 'A': return ARROW_UP;
-                case 'B': return ARROW_DOWN;
-                case 'C': return ARROW_RIGHT;
-                case 'D': return ARROW_LEFT;
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
             }
         }
 
@@ -147,8 +196,11 @@ int getWindowSize(int *rows, int *cols) {
     }
 }
 
-
-/*** append buffer ***/
+//
+//
+/************* append buffer *************/
+//
+//
 
 
 struct abuf {
@@ -171,7 +223,12 @@ void abAppend(struct abuf *ab, const char *s, int len) {
   }
 
 
-/*** output ***/
+
+//
+//
+/************* output *************/
+//
+//
 
 // Draws a ~ in each row, which means that row is not part of the file and can't contain any text
 void editorDrawRows(struct abuf *ab) {
@@ -186,7 +243,11 @@ void editorDrawRows(struct abuf *ab) {
 
             // Center message
             int padding = (E.screencols - welcomelen) / 2;
-            if (padding--) abAppend(ab, " ", 1);
+            if (padding) {
+                abAppend(ab, "~", 1);
+                padding--;
+            } 
+            while (padding--) abAppend(ab, " ", 1);
             abAppend(ab, welcome, welcomelen);
         } 
         else {
@@ -219,8 +280,6 @@ void editorRefreshScreen() {
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
     abAppend(&ab, buf, strlen(buf));
 
-    abAppend(&ab, "\x1b[H", 3);
-
     // Show cursor
     abAppend(&ab, "\x1b[?25h", 6);
 
@@ -229,22 +288,33 @@ void editorRefreshScreen() {
     abFree(&ab);
 }
 
-
-/*** input ***/
+//
+//
+/************* input *************/
+//
+//
 
 void editorMoveCursor(int key) {
     switch (key) {
       case ARROW_LEFT:
-        E.cx--;
+        if (E.cx != 0) {
+            E.cx--;
+        }
         break;
       case ARROW_RIGHT:
-        E.cx++;
+        if (E.cx != E.screencols - 1) {
+            E.cx++;
+        }
         break;
       case ARROW_UP:
-        E.cy--;
+        if (E.cy != 0) {
+            E.cy--;
+        }
         break;
       case ARROW_DOWN:
-        E.cy++;
+        if (E.cy != E.screenrows - 1) {
+            E.cy++;
+        }
         break;
     }
 }
@@ -258,6 +328,24 @@ void editorProcessKeypress() {
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
+
+        case HOME_KEY:
+            E.cx = 0;
+            break;
+
+        case END_KEY:
+            E.cx = E.screencols - 1;
+            break;
+        
+        case PAGE_UP:
+        case PAGE_DOWN:
+            {
+                int times = E.screenrows;
+                while (times--)
+                    editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+            }
+            break;
+
         case ARROW_UP:
         case ARROW_DOWN:
         case ARROW_LEFT:
@@ -267,8 +355,11 @@ void editorProcessKeypress() {
     }
 }
 
-
-/*** init ***/
+//
+//
+/************* init *************/
+//
+//
 
 void initEditor() {
     E.cx = 0;
