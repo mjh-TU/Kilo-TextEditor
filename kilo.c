@@ -7,9 +7,11 @@
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
 #define _GNU_SOURCE
+#define KILO_QUIT_TIMES 3
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -30,6 +32,7 @@
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -71,6 +74,8 @@ struct editorConfig {
     int numrows;
     // Make E.row an array of erow structs. That way we can store multiple lines and will be a dynamically allocated array, so we'll make it a pointer to erow and initialize the pointer to NULL.
     erow *row;
+    // We call a text buffer "dirty" if it has been modified since opening or saving the file
+    int dirty;
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
@@ -86,6 +91,19 @@ void die(const char *s) {
     perror(s);
     exit(1);
 }
+
+//
+//
+/************* prototypes *************/
+//
+//
+
+// To fix error because we were trying to call the function before it was defined so we declare this function here which allows us to call the function before its defined
+void editorSetStatusMessage(const char *fmt, ...);
+void editorRefreshScreen();
+char *editorPrompt(char *prompt);
+
+
 
 //
 //
@@ -269,13 +287,13 @@ void editorUpdateRow(erow *row) {
 
 
 
-// Move the code in editorOpen that initializes E.row to a new function called editorAppendRow.
-// We want editorAppendrow to allocate space for a new erow, and then copy the given string to a new erow at the end of the E.row array.
-void editorAppendRow(char *s, size_t len) {
+void editorInsertRow(int at, char *s, size_t len) {
+
+    if (at < 0 || at > E.numrows) return;
 
     E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+    memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
 
-    int at = E.numrows;
     E.row[at].size = len;
     E.row[at].chars = malloc(len + 1);
     memcpy(E.row[at].chars, s, len);
@@ -286,10 +304,99 @@ void editorAppendRow(char *s, size_t len) {
     editorUpdateRow(&E.row[at]);
 
     E.numrows++;
+    E.dirty++;
+}
+
+void editorFreeRow(erow *row) {
+    free(row->render);
+    free(row->chars);
+}
+
+void editorDelRow(int at) {
+    if (at < 0 || at >- E.numrows) return;
+    editorFreeRow(&E.row[at]);
+    memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+    E.numrows--;
+    E.dirty++;
 }
 
 
+// Insert a single character into erow, at a given position
+void editorRowInsertChar(erow *row, int at, int c) {
+    if (at < 0 || at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);
+    memmove(&row->chars[at+1], &row->chars[at], row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+    editorUpdateRow(row);
+    E.dirty++;
+}
 
+// When backspacing take current line and copy it to the previous line
+void editorRowAppendString(erow *row, char *s, size_t len) {
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(&row->chars[row->size], s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+void editorRowDelChar(erow *row, int at) {
+    if (at < 0 || at >= row->size) return;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size--;
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+
+//
+//
+/************* editor operations *************/
+//
+//
+
+void editorInsertChar(int c) {
+    // If cursor is on the tilde line after the end of the file, so append a new row to the file before isserting a character.
+    if (E.cy == E.numrows) {
+        editorInsertRow(E.numrows, "", 0);
+    }
+    editorRowInsertChar(&E.row[E.cy], E.cx, c);
+    E.cx++;
+}
+
+void editorInsertNewLine() {
+    if (E.cx == 0) {
+        editorInsertRow(E.cy, "", 0);
+    } else {
+        erow *row = &E.row[E.cy];
+        editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+        row = &E.row[E.cy];
+        row->size = E.cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+    }
+    E.cy++;
+    E.cx = 0;
+}
+
+void editorDelChar() {
+    if (E.cy == E.numrows) return;
+    // If cursor at begining of first line there is nothing to do
+    if (E.cx == 0 && E.cy == 0) return;
+
+    erow *row = &E.row[E.cy];
+    if (E.cx > 0) {
+        editorRowDelChar(row, E.cx - 1);
+        E.cx--;
+    } else {
+        E.cx = E.row[E.cy - 1].size;
+        editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+        editorDelRow(E.cy);
+        E.cy--;
+    }
+}
 
 
 //
@@ -297,6 +404,26 @@ void editorAppendRow(char *s, size_t len) {
 /************* file i/o *************/
 //
 //
+
+// Function that converts our array of erow structs into a single string that is ready to be written to a file
+char *editorRowsToString(int *buflen) {
+    int totlen = 0;
+    int j;
+    for (j = 0; j < E.numrows; j++)
+        totlen += E.row[j].size + 1;
+    *buflen = totlen;
+
+    char *buf = malloc(totlen);
+    char *p = buf;
+    for (j = 0; j < E.numrows; j++) {
+        memcpy(p, E.row[j].chars, E.row[j].size);
+        p += E.row[j].size;
+        *p = '\n';
+        p++;
+    }
+    return buf;
+}
+
 
 
 // Take a filename and opens the file for reading using fopen. Allow the user to choose a file by passing a filename via cli argument. If they did call editorOpen, if not editorOpen will not be called and they will start with a blank file.
@@ -319,12 +446,45 @@ void editorOpen(char *filename) {
         while (linelen > 0 && (line[linelen - 1] == '\n' ||
                                line[linelen - 1] == '\r'))
           linelen--;
-        editorAppendRow(line, linelen);
+        editorInsertRow(E.numrows, line, linelen);
     }
     free(line);
     fclose(fp);
+    E.dirty = 0;
 }
 
+
+void editorSave() {
+    // If it's a new file then E.filename will be NULL and won't know where to save (will fix later)
+    if (E.filename == NULL) {
+        E.filename = editorPrompt("Save as: %s (ESC to cancel)");
+        if (E.filename == NULL) {
+            editorSetStatusMessage("Save aborted");
+            return;
+        }
+    }
+
+    int len;
+    char *buf = editorRowsToString(&len);
+    // Tell open to create a new file it not already exists (O_CREAT) and pass extra argument containing the mode (permissions) the new file should have
+    int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+
+    // Both open() and ftruncate() both return -1 on error. Whether or not an error occured, we ensure that the file is closed and the memory that buf points to is freed
+    if (fd != -1) {
+        if (ftruncate(fd, len) != -1) {
+            if (write(fd, buf, len) == len) {
+                close(fd);
+                free(buf);
+                E.dirty = 0;
+                editorSetStatusMessage("%d bytes written to disk", len);
+                return;
+            }
+        }
+        close(fd);
+    }
+    free(buf);
+    editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
 
 
 //
@@ -428,7 +588,7 @@ void editorDrawStatusBar(struct abuf *ab) {
     abAppend(ab, "\x1b[7m", 4);
 
     char status[80], rstatus[80];
-    int len = snprintf(status, sizeof(status), "%.20s - %d lines", E.filename ? E.filename : "[No Name]", E.numrows);
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines %s", E.filename ? E.filename : "[No Name]", E.numrows, E.dirty ? "(modified)" : "");
     int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
     if (len > E.screencols) len = E.screencols;
     abAppend(ab, status, len);
@@ -500,6 +660,44 @@ void editorSetStatusMessage(const char *fmt, ...) {
 //
 //
 
+// Function to display a prompt in the status bar and lets the suer input a line of text after the prompt
+char *editorPrompt(char *prompt) {
+    size_t bufsize = 128;
+    char *buf = malloc(bufsize);
+
+    size_t buflen = 0;
+    buf[0] = '\0';
+
+    while (1) {
+        editorSetStatusMessage(prompt, buf);
+        editorRefreshScreen();
+
+        int c = editorReadKey();
+
+        if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+            if (buflen != 0) buf[--buflen] = '\0';
+        } else if (c == '\x1b') {
+            editorSetStatusMessage("");
+            free(buf);
+            return NULL;
+        } else if (c == '\r') {
+            if (buflen != 0) {
+                editorSetStatusMessage("");
+                return buf;
+            }
+        } else if (!iscntrl(c) && c < 128) {
+            if (buflen == bufsize - 1) {
+                bufsize *= 2;
+                buf = realloc(buf, bufsize);
+            }
+            buf[buflen++] = c;
+            buf[buflen] = '\0';
+        }
+    }
+}
+
+
+
 void editorMoveCursor(int key) {
     erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
 
@@ -542,12 +740,29 @@ void editorMoveCursor(int key) {
 
 
 void editorProcessKeypress() {
+    static int quit_times = KILO_QUIT_TIMES;
+
     int c = editorReadKey();
     switch (c) {
+
+        // Enter Key
+        case '\r':
+            editorInsertNewLine();
+            break;
+
         case CTRL_KEY('q'):
+            if (E.dirty && quit_times > 0) {
+                editorSetStatusMessage("WARNING!!! File has unsaved changes. " "Press Ctrl-Q %d more times to quit.", quit_times);
+                quit_times--;
+                return;
+            }
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
+            break;
+
+        case CTRL_KEY('s'):
+            editorSave();
             break;
 
         case HOME_KEY:
@@ -557,6 +772,14 @@ void editorProcessKeypress() {
         case END_KEY:
             if (E.cy < E.numrows)
                 E.cx = E.row[E.cy].size;
+            break;
+
+        case BACKSPACE:
+        // Backspace character (original ctrl h back in old days)
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+            if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+            editorDelChar();
             break;
         
         case PAGE_UP:
@@ -581,7 +804,18 @@ void editorProcessKeypress() {
         case ARROW_RIGHT:
             editorMoveCursor(c);
             break;
+
+        // Ctrl - l is originally to refresh screen but our editor does that already
+        case CTRL_KEY('l'):
+        case '\x1b':
+            break;
+
+        default:
+            // If keyboard press not mapped to something write to file
+            editorInsertChar(c);
+            break;
     }
+    quit_times = KILO_QUIT_TIMES;
 }
 
 //
@@ -600,6 +834,7 @@ void initEditor() {
     // For now editor will only display a single line of text, and so numrows can be either 0 or 1
     E.numrows = 0;
     E.row = NULL;
+    E.dirty = 0;
     E.filename = NULL;
     // Initialize E.statusmsg to an empty string so the message will be displayed by default
     E.statusmsg[0] = '\0';
@@ -619,7 +854,7 @@ int main(int argc, char *argv[]) {
         editorOpen(argv[1]);
     }
     
-    editorSetStatusMessage("HELP: Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
 
     // Read STDIN and save to char c variable. If variable is q then quit. Runs infinitely.
     while (1) {
