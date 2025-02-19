@@ -101,7 +101,7 @@ void die(const char *s) {
 // To fix error because we were trying to call the function before it was defined so we declare this function here which allows us to call the function before its defined
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 
 
@@ -470,7 +470,7 @@ void editorOpen(char *filename) {
 void editorSave() {
     // If it's a new file then E.filename will be NULL and won't know where to save (will fix later)
     if (E.filename == NULL) {
-        E.filename = editorPrompt("Save as: %s (ESC to cancel)");
+        E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
         if (E.filename == NULL) {
             editorSetStatusMessage("Save aborted");
             return;
@@ -507,10 +507,10 @@ void editorSave() {
 //
 //
 
-// When user types a search query and presses enter, we'll loop through all the rows of the file and if a row contains their query string, we'll move the cursor to the match
-void editorFind() {
-    char *query = editorPrompt("Search: %s (ESC to cancel)");
-    if (query == NULL) return;
+void editorFindCallback(char *query, int key) {
+    if (key == '\r' || key == '\x1b') {
+        return;
+    }
 
     int i;
     for (i=0; i < E.numrows; i++) {
@@ -525,7 +525,15 @@ void editorFind() {
             break;
         }
     }
-    free(query);
+}
+
+
+void editorFind() {
+    char *query = editorPrompt("Search: %s (ESC to cancel)", editorFindCallback);
+
+    if (query) {
+        free(query);
+    }
 }
 
 //
@@ -702,7 +710,7 @@ void editorSetStatusMessage(const char *fmt, ...) {
 //
 
 // Function to display a prompt in the status bar and lets the suer input a line of text after the prompt
-char *editorPrompt(char *prompt) {
+char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     size_t bufsize = 128;
     char *buf = malloc(bufsize);
 
@@ -719,11 +727,13 @@ char *editorPrompt(char *prompt) {
             if (buflen != 0) buf[--buflen] = '\0';
         } else if (c == '\x1b') {
             editorSetStatusMessage("");
+            if (callback) callback(buf, c);
             free(buf);
             return NULL;
         } else if (c == '\r') {
             if (buflen != 0) {
                 editorSetStatusMessage("");
+                if (callback) callback(buf, c);
                 return buf;
             }
         } else if (!iscntrl(c) && c < 128) {
@@ -734,6 +744,8 @@ char *editorPrompt(char *prompt) {
             buf[buflen++] = c;
             buf[buflen] = '\0';
         }
+
+        if (callback) callback(buf, c);
     }
 }
 
